@@ -1,0 +1,333 @@
+﻿from pathlib import Path
+
+html = r'''<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BLE ESC/POS 測試列印</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Arial, sans-serif; max-width: 900px; margin: 0 auto; padding: 16px; line-height: 1.5; }
+    h1 { font-size: 24px; margin-bottom: 8px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; margin: 12px 0; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin: 8px 0; }
+    input, textarea, button, select { font: inherit; padding: 10px; border-radius: 8px; border: 1px solid #bbb; }
+    input, textarea, select { flex: 1 1 240px; }
+    textarea { min-height: 120px; width: 100%; }
+    button { cursor: pointer; }
+    .log { white-space: pre-wrap; background: #111; color: #0f0; padding: 12px; border-radius: 12px; min-height: 180px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .muted { color: #555; font-size: 14px; }
+    .danger { color: #b00020; }
+    .ok { color: #0a7a22; }
+    code { background: #f3f3f3; padding: 2px 4px; border-radius: 4px; }
+    ul { padding-left: 20px; }
+  </style>
+</head>
+<body>
+  <h1>BLE ESC/POS 測試列印</h1>
+  <p class="muted">用途：Android Chrome 上直接用 Web Bluetooth 連 BLE 印表機，送出 ESC/POS 測試資料。</p>
+
+  <div class="card">
+    <strong>使用步驟</strong>
+    <ol>
+      <li>請用 <b>Android Chrome</b> 開啟，且必須跑在 <b>HTTPS</b>。</li>
+      <li>先點「搜尋 BLE 印表機」。</li>
+      <li>連上後，先點「列出 Services / Characteristics」。</li>
+      <li>找出可寫入的 characteristic（通常有 <code>write</code> 或 <code>writeWithoutResponse</code>）。</li>
+      <li>把 UUID 填到下方，再點「測試列印」。</li>
+    </ol>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <input id="namePrefix" placeholder="裝置名稱前綴（可空白，例如：MTP、Printer）" />
+      <button id="btnConnect">搜尋 BLE 印表機</button>
+      <button id="btnDisconnect">斷線</button>
+    </div>
+    <div class="row">
+      <input id="serviceUuid" placeholder="列印 Service UUID，例如 18f0 或完整 UUID" />
+      <input id="charUuid" placeholder="列印 Characteristic UUID，例如 2af1 或完整 UUID" />
+    </div>
+    <div class="row">
+      <button id="btnDiscover">列出 Services / Characteristics</button>
+      <button id="btnTest">測試列印</button>
+      <button id="btnRaw">送出自訂文字</button>
+    </div>
+    <div class="row">
+      <textarea id="rawText" placeholder="自訂列印文字"></textarea>
+    </div>
+    <div class="row">
+      <label><input type="checkbox" id="chkCut" checked /> 送切紙指令（有些 BLE 小票機不支援）</label>
+    </div>
+  </div>
+
+  <div class="card">
+    <strong>已連線資訊</strong>
+    <div id="deviceInfo" class="muted">尚未連線</div>
+  </div>
+
+  <div class="card">
+    <strong>Log</strong>
+    <div id="log" class="log"></div>
+  </div>
+
+  <script>
+    let device = null;
+    let server = null;
+    let writableCharacteristic = null;
+
+    const $ = (id) => document.getElementById(id);
+
+    function log(msg) {
+      const ts = new Date().toLocaleTimeString();
+      $("log").textContent += `[${ts}] ${msg}\n`;
+      $("log").scrollTop = $("log").scrollHeight;
+      console.log(msg);
+    }
+
+    function setDeviceInfo() {
+      if (!device) {
+        $("deviceInfo").textContent = "尚未連線";
+        return;
+      }
+      $("deviceInfo").innerHTML = `
+        <div><b>名稱：</b>${device.name || "(無名稱)"}</div>
+        <div><b>ID：</b>${device.id || "(無 ID)"}</div>
+        <div><b>已連線：</b>${device.gatt?.connected ? "是" : "否"}</div>
+      `;
+    }
+
+    function sleep(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    function hexToBytes(hex) {
+      const clean = hex.replace(/[^0-9a-fA-F]/g, "");
+      if (clean.length % 2 !== 0) throw new Error("十六進位字串長度必須是偶數");
+      const out = new Uint8Array(clean.length / 2);
+      for (let i = 0; i < clean.length; i += 2) {
+        out[i / 2] = parseInt(clean.slice(i, i + 2), 16);
+      }
+      return out;
+    }
+
+    function concatBytes(...arrays) {
+      const total = arrays.reduce((sum, arr) => sum + arr.length, 0);
+      const out = new Uint8Array(total);
+      let offset = 0;
+      for (const arr of arrays) {
+        out.set(arr, offset);
+        offset += arr.length;
+      }
+      return out;
+    }
+
+    function buildEscPosTestTicket(text) {
+      const encoder = new TextEncoder();
+
+      const init = new Uint8Array([0x1B, 0x40]); // ESC @
+      const alignCenter = new Uint8Array([0x1B, 0x61, 0x01]); // ESC a 1
+      const alignLeft = new Uint8Array([0x1B, 0x61, 0x00]);   // ESC a 0
+      const doubleOn = new Uint8Array([0x1D, 0x21, 0x11]);    // GS ! 17
+      const doubleOff = new Uint8Array([0x1D, 0x21, 0x00]);   // GS ! 0
+      const feed3 = new Uint8Array([0x0A, 0x0A, 0x0A]);       // LF x3
+      const cut = new Uint8Array([0x1D, 0x56, 0x00]);         // GS V 0
+      const line = encoder.encode("--------------------------------\n");
+      const body = encoder.encode(text + "\n");
+      const footer = encoder.encode("BLE / ESC-POS WEB TEST\n\n");
+
+      const payload = concatBytes(
+        init,
+        alignCenter,
+        doubleOn,
+        encoder.encode("TEST PRINT\n"),
+        doubleOff,
+        line,
+        alignLeft,
+        body,
+        line,
+        alignCenter,
+        footer,
+        feed3,
+        $("chkCut").checked ? cut : new Uint8Array([])
+      );
+      return payload;
+    }
+
+    async function connectDevice() {
+      if (!navigator.bluetooth) {
+        throw new Error("這個瀏覽器不支援 Web Bluetooth");
+      }
+
+      const namePrefix = $("namePrefix").value.trim();
+      const options = namePrefix
+        ? {
+            filters: [{ namePrefix }],
+            acceptAllDevices: false,
+            optionalServices: []
+          }
+        : {
+            acceptAllDevices: true,
+            optionalServices: []
+          };
+
+      log("開啟 BLE 裝置選擇器...");
+      device = await navigator.bluetooth.requestDevice(options);
+      device.addEventListener("gattserverdisconnected", () => {
+        log("裝置已斷線");
+        writableCharacteristic = null;
+        setDeviceInfo();
+      });
+
+      log(`已選擇裝置：${device.name || "(無名稱)"}`);
+      server = await device.gatt.connect();
+      log("GATT 連線成功");
+      setDeviceInfo();
+    }
+
+    async function discoverServices() {
+      if (!server) throw new Error("請先連線");
+      const services = await server.getPrimaryServices();
+      log(`找到 ${services.length} 個 primary service`);
+
+      for (const svc of services) {
+        log(`Service: ${svc.uuid}`);
+        const chars = await svc.getCharacteristics();
+        for (const ch of chars) {
+          const p = ch.properties;
+          const props = Object.keys(p).filter(k => p[k]).join(", ");
+          log(`  Characteristic: ${ch.uuid} | properties: ${props}`);
+        }
+      }
+      log("請從上面找有 write / writeWithoutResponse 的 characteristic UUID");
+    }
+
+    async function getWritableCharacteristic() {
+      if (writableCharacteristic) return writableCharacteristic;
+      if (!server) throw new Error("請先連線");
+
+      const serviceUuid = $("serviceUuid").value.trim();
+      const charUuid = $("charUuid").value.trim();
+
+      if (!serviceUuid || !charUuid) {
+        throw new Error("請先填入 Service UUID 與 Characteristic UUID");
+      }
+
+      const service = await server.getPrimaryService(serviceUuid);
+      const characteristic = await service.getCharacteristic(charUuid);
+
+      const p = characteristic.properties;
+      const supportsWrite = !!p.write;
+      const supportsWriteNoRsp = !!p.writeWithoutResponse;
+
+      log(`選定 characteristic: ${characteristic.uuid}`);
+      log(`可寫入屬性：write=${supportsWrite}, writeWithoutResponse=${supportsWriteNoRsp}`);
+
+      if (!supportsWrite && !supportsWriteNoRsp) {
+        throw new Error("這個 characteristic 沒有可寫入屬性");
+      }
+
+      writableCharacteristic = characteristic;
+      return characteristic;
+    }
+
+    async function writeChunk(characteristic, chunk) {
+      if (characteristic.properties.writeWithoutResponse && characteristic.writeValueWithoutResponse) {
+        await characteristic.writeValueWithoutResponse(chunk);
+      } else if (characteristic.properties.write && characteristic.writeValueWithResponse) {
+        await characteristic.writeValueWithResponse(chunk);
+      } else if (characteristic.writeValue) {
+        await characteristic.writeValue(chunk);
+      } else {
+        throw new Error("找不到可用的寫入方法");
+      }
+    }
+
+    async function writeInChunks(data, chunkSize = 180, delayMs = 30) {
+      const characteristic = await getWritableCharacteristic();
+      for (let i = 0; i < data.length; i += chunkSize) {
+        const chunk = data.slice(i, i + chunkSize);
+        await writeChunk(characteristic, chunk);
+        log(`已送出 ${i + chunk.length}/${data.length} bytes`);
+        await sleep(delayMs);
+      }
+    }
+
+    async function testPrint() {
+      const payload = buildEscPosTestTicket(
+        "Hello from Android Chrome\n這是 BLE ESC/POS 測試\n1234567890"
+      );
+      log(`準備送出測試列印，共 ${payload.length} bytes`);
+      await writeInChunks(payload, 180, 30);
+      log("測試列印已送出");
+    }
+
+    async function rawPrint() {
+      const text = $("rawText").value || "自訂列印內容";
+      const payload = buildEscPosTestTicket(text);
+      log(`準備送出自訂列印，共 ${payload.length} bytes`);
+      await writeInChunks(payload, 180, 30);
+      log("自訂列印已送出");
+    }
+
+    async function disconnectDevice() {
+      try {
+        if (device?.gatt?.connected) {
+          device.gatt.disconnect();
+          log("已主動斷線");
+        }
+      } finally {
+        writableCharacteristic = null;
+        setDeviceInfo();
+      }
+    }
+
+    $("btnConnect").addEventListener("click", async () => {
+      try {
+        await connectDevice();
+      } catch (err) {
+        log("連線失敗：" + (err?.message || err));
+      }
+    });
+
+    $("btnDiscover").addEventListener("click", async () => {
+      try {
+        await discoverServices();
+      } catch (err) {
+        log("列出失敗：" + (err?.message || err));
+      }
+    });
+
+    $("btnTest").addEventListener("click", async () => {
+      try {
+        await testPrint();
+      } catch (err) {
+        log("測試列印失敗：" + (err?.message || err));
+      }
+    });
+
+    $("btnRaw").addEventListener("click", async () => {
+      try {
+        await rawPrint();
+      } catch (err) {
+        log("自訂列印失敗：" + (err?.message || err));
+      }
+    });
+
+    $("btnDisconnect").addEventListener("click", async () => {
+      try {
+        await disconnectDevice();
+      } catch (err) {
+        log("斷線失敗：" + (err?.message || err));
+      }
+    });
+
+    setDeviceInfo();
+    log("頁面已載入。請先按「搜尋 BLE 印表機」。");
+  </script>
+</body>
+</html>
+'''
+path = Path('/mnt/data/ble_escpos_test.html')
+path.write_text(html, encoding='utf-8')
+print(f"Saved to {path}")
