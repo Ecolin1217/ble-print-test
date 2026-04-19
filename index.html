@@ -1,48 +1,79 @@
 <!DOCTYPE html>
-<html lang="zh-Hant">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>BLE ESC/POS 測試 v2</title>
-</head>
+<html>
 <body>
-<h2>BLE ESC/POS 測試 v2</h2>
+
+<h2>BLE 印表機測試（極簡版）</h2>
 
 <button onclick="connect()">連線</button>
-<button onclick="list()">列出 Service</button>
+<button onclick="testPrint()">測試列印</button>
 
 <pre id="log"></pre>
 
 <script>
-let device, server;
+let device, server, char;
 
-const optionalServices = [
-'18f0','fff0','ffe0','ff00','ae30','ae3a'
-];
-
-function log(msg){
-document.getElementById('log').textContent += msg + "\n";
+function log(t){
+  document.getElementById("log").textContent += t + "\n";
 }
 
 async function connect(){
-device = await navigator.bluetooth.requestDevice({
-acceptAllDevices: true,
-optionalServices
-});
-server = await device.gatt.connect();
-log("已連線：" + device.name);
+  device = await navigator.bluetooth.requestDevice({
+    acceptAllDevices: true,
+    optionalServices: [
+      '18f0','fff0','ffe0','ff00'
+    ]
+  });
+
+  server = await device.gatt.connect();
+  log("已連線: " + device.name);
+
+  // 嘗試常見寫入點（自動掃）
+  let services = await server.getPrimaryServices();
+
+  for(let s of services){
+    let chars = await s.getCharacteristics();
+    for(let c of chars){
+      if(c.properties.write || c.properties.writeWithoutResponse){
+        char = c;
+        log("找到可寫入 characteristic: " + c.uuid);
+        return;
+      }
+    }
+  }
+
+  log("❌ 找不到可寫入通道");
 }
 
-async function list(){
-let services = await server.getPrimaryServices();
-for(let s of services){
-log("Service: " + s.uuid);
-let chars = await s.getCharacteristics();
-for(let c of chars){
-let props = Object.keys(c.properties).filter(k=>c.properties[k]).join(",");
-log("  Char: " + c.uuid + " | " + props);
+function textToBytes(text){
+  return new TextEncoder().encode(text);
 }
-}
+
+async function testPrint(){
+  if(!char){
+    log("請先連線");
+    return;
+  }
+
+  // ESC/POS 指令
+  const data = new Uint8Array([
+    0x1B,0x40,                 // init
+    ...textToBytes("TEST PRINT\n"),
+    ...textToBytes("HELLO BLE\n\n"),
+    0x0A,0x0A,0x0A
+  ]);
+
+  // 分段寫入（很重要）
+  for(let i=0;i<data.length;i+=100){
+    let chunk = data.slice(i, i+100);
+
+    if(char.writeValueWithoutResponse){
+      await char.writeValueWithoutResponse(chunk);
+    }else{
+      await char.writeValue(chunk);
+    }
+  }
+
+  log("已送出列印");
 }
 </script>
 
